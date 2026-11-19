@@ -1,0 +1,102 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run automated tests
+        run: npm test
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/catalogo-libros-api:${{ github.sha }}
+            ${{ secrets.DOCKER_USERNAME }}/catalogo-libros-api:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+            CURRENT_IMAGE=$(docker ps --filter "name=api-libros" --format "{{.Image}}" || true)
+            NEW_IMAGE="${{ secrets.DOCKER_USERNAME }}/catalogo-libros-api:${{ github.sha }}"
+
+            echo "Descargando imagen: $NEW_IMAGE"
+            docker pull "$NEW_IMAGE"
+
+            echo "Desplegando nuevo contenedor..."
+            docker rename api-libros api-libros-rollback 2>/dev/null || true
+            docker stop api-libros-rollback 2>/dev/null || true
+
+            docker run -d \
+              --name api-libros \
+              --restart unless-stopped \
+              -p 127.0.0.1:3000:3000 \
+              --env-file /home/${{ secrets.EC2_USER }}/.env \
+              "$NEW_IMAGE"
+
+            sleep 5
+
+            echo "Verificando salud del despliegue..."
+            HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health || true)
+            LIBROS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/libros || true)
+
+            if [ "$HEALTH_CODE" = "200" ] && [ "$LIBROS_CODE" = "200" ]; then
+              echo "Despliegue verificado correctamente."
+              docker rm -f api-libros-rollback 2>/dev/null || true
+              docker logout
+            else
+              echo "Comprobacion fallida (Health: $HEALTH_CODE, Libros: $LIBROS_CODE). Ejecutando rollback..."
+              docker rm -f api-libros 2>/dev/null || true
+              if [ -n "$CURRENT_IMAGE" ]; then
+                docker start api-libros-rollback 2>/dev/null || \
+                docker run -d --name api-libros --restart unless-stopped -p 127.0.0.1:3000:3000 --env-file /home/${{ secrets.EC2_USER }}/.env "$CURRENT_IMAGE"
+                docker rename api-libros-rollback api-libros 2>/dev/null || true
+              fi
+              docker logout
+              exit 1
+            fi
